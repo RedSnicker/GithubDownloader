@@ -29,7 +29,7 @@ jobs:
       - name: Install yt-dlp and ffmpeg
         run: |
           pip install --upgrade yt-dlp
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
 
       - name: Create videos directory
@@ -42,7 +42,6 @@ jobs:
             exit 1
           fi
 
-          # Remove empty lines and comments (lines starting with #)
           grep -v '^\s*$' videos.txt | grep -v '^\s*#' > /tmp/clean_links.txt || true
 
           if [ ! -s /tmp/clean_links.txt ]; then
@@ -51,12 +50,11 @@ jobs:
           fi
 
           echo "=== Starting downloads ==="
-
           DOWNLOAD_COUNT=0
           FAIL_COUNT=0
 
           while IFS= read -r url; do
-            url=$(echo "$url" | xargs) # trim whitespace
+            url=$(echo "$url" | xargs)
             if [ -z "$url" ]; then
               continue
             fi
@@ -66,9 +64,8 @@ jobs:
             echo "Downloading: $url"
             echo "----------------------------------------"
 
-            # Download at 720p max, merge to mp4, sanitize filename
             yt-dlp \
-              -f "bestvideo[height<=720]+bestaudio/best[height<=720]/bestvideo[height<=480]+bestaudio/best" \
+              -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
               --merge-output-format mp4 \
               --output "videos/%(title)s [%(id)s].%(ext)s" \
               --restrict-filenames \
@@ -76,13 +73,7 @@ jobs:
               --no-playlist \
               --retries 3 \
               --socket-timeout 30 \
-              "$url" && {
-                echo "✅ Successfully downloaded: $url"
-                DOWNLOAD_COUNT=$((DOWNLOAD_COUNT + 1))
-              } || {
-                echo "❌ Failed to download: $url"
-                FAIL_COUNT=$((FAIL_COUNT + 1))
-              }
+              "$url" && DOWNLOAD_COUNT=$((DOWNLOAD_COUNT + 1)) || FAIL_COUNT=$((FAIL_COUNT + 1))
 
           done < /tmp/clean_links.txt
 
@@ -90,8 +81,6 @@ jobs:
           echo "=== Download Summary ==="
           echo "Successful: $DOWNLOAD_COUNT"
           echo "Failed: $FAIL_COUNT"
-
-          # List downloaded files
           echo ""
           echo "=== Files in videos/ ==="
           ls -lh videos/ 2>/dev/null || echo "No files downloaded"
@@ -100,7 +89,132 @@ jobs:
         id: check_files
         run: |
           VIDEO_COUNT=$(find videos -maxdepth 1 -name "*.mp4" -type f 2>/dev/null | wc -l)
-          echo "video_count=$VIDEO_COUNT" >> $GITHUB_OUTPUT
+          echo "video_count=${VIDEO_COUNT}" >> $GITHUB_OUTPUT
 
-          if [ "$VIDEO_COUNT" -gt 0 ]; then
-            
+          if [ "${VIDEO_COUNT}" -gt 0 ]; then
+            echo "has_videos=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_videos=false" >> $GITHUB_OUTPUT
+          fi
+
+          TOTAL_SIZE=$(du -sh videos/ 2>/dev/null | cut -f1 || echo "0")
+          echo "total_size=${TOTAL_SIZE}" >> $GITHUB_OUTPUT
+
+      - name: Configure Git
+        if: steps.check_files.outputs.has_videos == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit videos to repo
+        if: steps.check_files.outputs.has_videos == 'true'
+        id: commit_videos
+        run: |
+          COMMITTED=0
+          SKIPPED=0
+
+          for file in videos/*.mp4; do
+            if [ ! -f "$file" ]; then
+              continue
+            fi
+
+            FILE_SIZE=$(stat --format=%s "$file")
+            FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+            FILE_NAME=$(basename "$file")
+
+            if [ "$FILE_SIZE_MB" -lt 100 ]; then
+              git add "$file"
+              echo "Staged: $FILE_NAME (${FILE_SIZE_MB}MB)"
+              COMMITTED=$((COMMITTED + 1))
+            else
+              echo "Skipped (too large): $FILE_NAME (${FILE_SIZE_MB}MB)"
+              SKIPPED=$((SKIPPED + 1))
+            fi
+          done
+
+          echo "committed_count=${COMMITTED}" >> $GITHUB_OUTPUT
+          echo "skipped_count=${SKIPPED}" >> $GITHUB_OUTPUT
+
+          if [ "$COMMITTED" -gt 0 ]; then
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            git commit -m "📹 Auto-download: Added ${COMMITTED} video(s) - ${TIMESTAMP}"
+            git push
+            echo "repo_pushed=true" >> $GITHUB_OUTPUT
+          else
+            echo "No files small enough to commit to repo"
+            echo "repo_pushed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate release tag and body
+        if: steps.check_files.outputs.has_videos == 'true'
+        id: release_info
+        run: |
+          TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+          TAG="videos-${TIMESTAMP}"
+          READABLE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "timestamp=${READABLE}" >> $GITHUB_OUTPUT
+
+          {
+            echo "## 📹 Auto-Downloaded Videos"
+            echo ""
+            echo "**Downloaded at:** ${READABLE}"
+            echo "**Total files:** ${{ steps.check_files.outputs.video_count }}"
+            echo "**Total size:** ${{ steps.check_files.outputs.total_size }}"
+            echo ""
+            echo "### Files included:"
+            echo ""
+            for file in videos/*.mp4; do
+              if [ -f "$file" ]; then
+                FILE_NAME=$(basename "$file")
+                FILE_SIZE=$(du -h "$file" | cut -f1)
+                echo "- \`${FILE_NAME}\` (${FILE_SIZE})"
+              fi
+            done
+            echo ""
+            echo "### Source links:"
+            echo ""
+            echo '```'
+            cat videos.txt
+            echo '```'
+          } > /tmp/release_body.md
+
+      - name: Copy assets for release
+        if: steps.check_files.outputs.has_videos == 'true'
+        run: |
+          mkdir -p /tmp/release_assets
+          for file in videos/*.mp4; do
+            if [ -f "$file" ]; then
+              cp "$file" /tmp/release_assets/
+            fi
+          done
+          echo "=== Release assets ==="
+          ls -lh /tmp/release_assets/
+
+      - name: Create GitHub Release
+        if: steps.check_files.outputs.has_videos == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          name: "📹 Videos - ${{ steps.release_info.outputs.timestamp }}"
+          body_path: /tmp/release_body.md
+          draft: false
+          prerelease: false
+          files: /tmp/release_assets/*.mp4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 📊 Workflow Summary"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Videos downloaded | ${{ steps.check_files.outputs.video_count }} |"
+            echo "| Total size | ${{ steps.check_files.outputs.total_size }} |"
+            echo "| Committed to repo | ${{ steps.commit_videos.outputs.committed_count || '0' }} |"
+            echo "| Skipped (too large) | ${{ steps.commit_videos.outputs.skipped_count || '0' }} |"
+            echo "| Release created | ${{ steps.check_files.outputs.has_videos }} |"
+          } >> $GITHUB_STEP_SUMMARY
