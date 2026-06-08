@@ -35,52 +35,118 @@ jobs:
       - name: Create videos directory
         run: mkdir -p videos
 
+      - name: Write cookies from base64 secret
+        run: |
+          python3 << 'PYEOF'
+          import base64
+          import os
+
+          b64 = os.environ.get('COOKIES_B64', '')
+
+          if b64:
+              try:
+                  cookies = base64.b64decode(b64).decode('utf-8')
+                  with open('/tmp/cookies.txt', 'w') as f:
+                      f.write(cookies)
+                  lines = len(cookies.splitlines())
+                  print(f'✅ Decoded cookies file: {lines} lines')
+              except Exception as e:
+                  print(f'❌ Failed to decode cookies: {e}')
+                  open('/tmp/cookies.txt', 'w').close()
+          else:
+              print('⚠️ No YOUTUBE_COOKIES_B64 secret found')
+              print('YouTube downloads may fail without authentication')
+              open('/tmp/cookies.txt', 'w').close()
+          PYEOF
+        env:
+          COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+
+      - name: Validate cookies file
+        run: |
+          if [ -s /tmp/cookies.txt ]; then
+            LINES=$(wc -l < /tmp/cookies.txt)
+            echo "✅ Cookies file has ${LINES} lines"
+          else
+            echo "⚠️ Cookies file is empty - YouTube may block downloads"
+          fi
+
       - name: Download videos at 720p
         run: |
           if [ ! -f videos.txt ]; then
-            echo "videos.txt not found!"
+            echo "❌ videos.txt not found!"
             exit 1
           fi
 
+          # Remove empty lines and comments
           grep -v '^\s*$' videos.txt | grep -v '^\s*#' > /tmp/clean_links.txt || true
 
           if [ ! -s /tmp/clean_links.txt ]; then
-            echo "No valid links found in videos.txt"
+            echo "⚠️ No valid links found in videos.txt"
             exit 0
           fi
 
-          echo "=== Starting downloads ==="
+          TOTAL_LINKS=$(wc -l < /tmp/clean_links.txt)
+          echo "=== Starting downloads (${TOTAL_LINKS} links) ==="
+
           DOWNLOAD_COUNT=0
           FAIL_COUNT=0
+          CURRENT=0
 
-          while IFS= read -r url; do
+          # Build cookie argument
+          COOKIE_ARG=""
+          if [ -s /tmp/cookies.txt ]; then
+            COOKIE_ARG="--cookies /tmp/cookies.txt"
+            echo "🍪 Using cookies for authentication"
+          else
+            echo "⚠️ No cookies - proceeding without authentication"
+          fi
+
+          while IFS= read -r url || [ -n "$url" ]; do
+            # Trim whitespace
             url=$(echo "$url" | xargs)
+
             if [ -z "$url" ]; then
               continue
             fi
 
+            CURRENT=$((CURRENT + 1))
             echo ""
-            echo "----------------------------------------"
-            echo "Downloading: $url"
-            echo "----------------------------------------"
+            echo "========================================"
+            echo "[${CURRENT}/${TOTAL_LINKS}] Downloading:"
+            echo "$url"
+            echo "========================================"
 
             yt-dlp \
-              -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
+              -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best" \
               --merge-output-format mp4 \
               --output "videos/%(title)s [%(id)s].%(ext)s" \
               --restrict-filenames \
               --no-overwrites \
               --no-playlist \
-              --retries 3 \
+              --retries 5 \
+              --retry-sleep 5 \
               --socket-timeout 30 \
-              "$url" && DOWNLOAD_COUNT=$((DOWNLOAD_COUNT + 1)) || FAIL_COUNT=$((FAIL_COUNT + 1))
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              --extractor-args "youtube:player_client=web,mweb" \
+              --add-header "Accept-Language:en-US,en;q=0.9" \
+              $COOKIE_ARG \
+              "$url" && {
+                echo "✅ Success: $url"
+                DOWNLOAD_COUNT=$((DOWNLOAD_COUNT + 1))
+              } || {
+                echo "❌ Failed: $url"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+              }
 
           done < /tmp/clean_links.txt
 
           echo ""
-          echo "=== Download Summary ==="
-          echo "Successful: $DOWNLOAD_COUNT"
-          echo "Failed: $FAIL_COUNT"
+          echo "========================================"
+          echo "         DOWNLOAD SUMMARY"
+          echo "========================================"
+          echo "✅ Successful: ${DOWNLOAD_COUNT}"
+          echo "❌ Failed: ${FAIL_COUNT}"
+          echo "📁 Total: ${TOTAL_LINKS}"
           echo ""
           echo "=== Files in videos/ ==="
           ls -lh videos/ 2>/dev/null || echo "No files downloaded"
@@ -93,8 +159,10 @@ jobs:
 
           if [ "${VIDEO_COUNT}" -gt 0 ]; then
             echo "has_videos=true" >> $GITHUB_OUTPUT
+            echo "✅ Found ${VIDEO_COUNT} video(s)"
           else
             echo "has_videos=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No videos were downloaded"
           fi
 
           TOTAL_SIZE=$(du -sh videos/ 2>/dev/null | cut -f1 || echo "0")
@@ -112,6 +180,9 @@ jobs:
         run: |
           COMMITTED=0
           SKIPPED=0
+          SKIPPED_FILES=""
+
+          echo "=== Checking file sizes ==="
 
           for file in videos/*.mp4; do
             if [ ! -f "$file" ]; then
@@ -124,11 +195,12 @@ jobs:
 
             if [ "$FILE_SIZE_MB" -lt 100 ]; then
               git add "$file"
-              echo "Staged: $FILE_NAME (${FILE_SIZE_MB}MB)"
+              echo "📁 Staged: ${FILE_NAME} (${FILE_SIZE_MB}MB)"
               COMMITTED=$((COMMITTED + 1))
             else
-              echo "Skipped (too large): $FILE_NAME (${FILE_SIZE_MB}MB)"
+              echo "⚠️ Too large for repo (>100MB): ${FILE_NAME} (${FILE_SIZE_MB}MB)"
               SKIPPED=$((SKIPPED + 1))
+              SKIPPED_FILES="${SKIPPED_FILES}${FILE_NAME}, "
             fi
           done
 
@@ -140,9 +212,14 @@ jobs:
             git commit -m "📹 Auto-download: Added ${COMMITTED} video(s) - ${TIMESTAMP}"
             git push
             echo "repo_pushed=true" >> $GITHUB_OUTPUT
+            echo "✅ Committed ${COMMITTED} video(s) to repository"
           else
-            echo "No files small enough to commit to repo"
             echo "repo_pushed=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No files small enough to commit to repo"
+          fi
+
+          if [ "$SKIPPED" -gt 0 ]; then
+            echo "ℹ️ Files only in release (too large for repo): ${SKIPPED_FILES}"
           fi
 
       - name: Generate release tag and body
@@ -152,43 +229,61 @@ jobs:
           TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
           TAG="videos-${TIMESTAMP}"
           READABLE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "timestamp=${READABLE}" >> $GITHUB_OUTPUT
 
+          # Create release body
+          cat << 'HEADER' > /tmp/release_body.md
+          ## 📹 Auto-Downloaded Videos
+
+          HEADER
+
           {
-            echo "## 📹 Auto-Downloaded Videos"
-            echo ""
             echo "**Downloaded at:** ${READABLE}"
             echo "**Total files:** ${{ steps.check_files.outputs.video_count }}"
             echo "**Total size:** ${{ steps.check_files.outputs.total_size }}"
             echo ""
-            echo "### Files included:"
+            echo "### 📁 Files included:"
             echo ""
-            for file in videos/*.mp4; do
-              if [ -f "$file" ]; then
-                FILE_NAME=$(basename "$file")
-                FILE_SIZE=$(du -h "$file" | cut -f1)
-                echo "- \`${FILE_NAME}\` (${FILE_SIZE})"
-              fi
-            done
+          } >> /tmp/release_body.md
+
+          for file in videos/*.mp4; do
+            if [ -f "$file" ]; then
+              FILE_NAME=$(basename "$file")
+              FILE_SIZE=$(du -h "$file" | cut -f1)
+              echo "- \`${FILE_NAME}\` (${FILE_SIZE})" >> /tmp/release_body.md
+            fi
+          done
+
+          {
             echo ""
-            echo "### Source links:"
+            echo "### 🔗 Source links:"
             echo ""
             echo '```'
             cat videos.txt
             echo '```'
-          } > /tmp/release_body.md
+            echo ""
+            echo "---"
+            echo "*Downloaded automatically by GitHub Actions*"
+          } >> /tmp/release_body.md
+
+          echo "✅ Release body generated"
 
       - name: Copy assets for release
         if: steps.check_files.outputs.has_videos == 'true'
         run: |
           mkdir -p /tmp/release_assets
+
           for file in videos/*.mp4; do
             if [ -f "$file" ]; then
               cp "$file" /tmp/release_assets/
+              echo "📦 Copied: $(basename "$file")"
             fi
           done
-          echo "=== Release assets ==="
+
+          echo ""
+          echo "=== Release assets ready ==="
           ls -lh /tmp/release_assets/
 
       - name: Create GitHub Release
@@ -204,17 +299,36 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Summary
+      - name: Cleanup sensitive files
+        if: always()
+        run: |
+          rm -f /tmp/cookies.txt
+          rm -f /tmp/cookies_b64.txt
+          echo "🧹 Cleaned up sensitive files"
+
+      - name: Job Summary
         if: always()
         run: |
           {
-            echo "## 📊 Workflow Summary"
+            echo "# 📊 Video Download Summary"
             echo ""
             echo "| Metric | Value |"
             echo "|--------|-------|"
-            echo "| Videos downloaded | ${{ steps.check_files.outputs.video_count }} |"
-            echo "| Total size | ${{ steps.check_files.outputs.total_size }} |"
-            echo "| Committed to repo | ${{ steps.commit_videos.outputs.committed_count || '0' }} |"
-            echo "| Skipped (too large) | ${{ steps.commit_videos.outputs.skipped_count || '0' }} |"
-            echo "| Release created | ${{ steps.check_files.outputs.has_videos }} |"
+            echo "| 📥 Videos downloaded | ${{ steps.check_files.outputs.video_count || '0' }} |"
+            echo "| 💾 Total size | ${{ steps.check_files.outputs.total_size || 'N/A' }} |"
+            echo "| ✅ Committed to repo | ${{ steps.commit_videos.outputs.committed_count || '0' }} |"
+            echo "| ⏭️ Skipped (>100MB) | ${{ steps.commit_videos.outputs.skipped_count || '0' }} |"
+            echo "| 🏷️ Release created | ${{ steps.check_files.outputs.has_videos || 'false' }} |"
+            echo ""
+            if [ "${{ steps.check_files.outputs.has_videos }}" == "true" ]; then
+              echo "## 📁 Downloaded Files"
+              echo ""
+              for file in videos/*.mp4 2>/dev/null; do
+                if [ -f "$file" ]; then
+                  FILE_NAME=$(basename "$file")
+                  FILE_SIZE=$(du -h "$file" | cut -f1)
+                  echo "- \`${FILE_NAME}\` (${FILE_SIZE})"
+                fi
+              done
+            fi
           } >> $GITHUB_STEP_SUMMARY
