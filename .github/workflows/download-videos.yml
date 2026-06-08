@@ -1,0 +1,106 @@
+name: Download Videos from videos.txt
+
+on:
+  push:
+    paths:
+      - 'videos.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download-videos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install yt-dlp and ffmpeg
+        run: |
+          pip install --upgrade yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Create videos directory
+        run: mkdir -p videos
+
+      - name: Download videos at 720p
+        run: |
+          if [ ! -f videos.txt ]; then
+            echo "videos.txt not found!"
+            exit 1
+          fi
+
+          # Remove empty lines and comments (lines starting with #)
+          grep -v '^\s*$' videos.txt | grep -v '^\s*#' > /tmp/clean_links.txt || true
+
+          if [ ! -s /tmp/clean_links.txt ]; then
+            echo "No valid links found in videos.txt"
+            exit 0
+          fi
+
+          echo "=== Starting downloads ==="
+
+          DOWNLOAD_COUNT=0
+          FAIL_COUNT=0
+
+          while IFS= read -r url; do
+            url=$(echo "$url" | xargs) # trim whitespace
+            if [ -z "$url" ]; then
+              continue
+            fi
+
+            echo ""
+            echo "----------------------------------------"
+            echo "Downloading: $url"
+            echo "----------------------------------------"
+
+            # Download at 720p max, merge to mp4, sanitize filename
+            yt-dlp \
+              -f "bestvideo[height<=720]+bestaudio/best[height<=720]/bestvideo[height<=480]+bestaudio/best" \
+              --merge-output-format mp4 \
+              --output "videos/%(title)s [%(id)s].%(ext)s" \
+              --restrict-filenames \
+              --no-overwrites \
+              --no-playlist \
+              --retries 3 \
+              --socket-timeout 30 \
+              "$url" && {
+                echo "✅ Successfully downloaded: $url"
+                DOWNLOAD_COUNT=$((DOWNLOAD_COUNT + 1))
+              } || {
+                echo "❌ Failed to download: $url"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+              }
+
+          done < /tmp/clean_links.txt
+
+          echo ""
+          echo "=== Download Summary ==="
+          echo "Successful: $DOWNLOAD_COUNT"
+          echo "Failed: $FAIL_COUNT"
+
+          # List downloaded files
+          echo ""
+          echo "=== Files in videos/ ==="
+          ls -lh videos/ 2>/dev/null || echo "No files downloaded"
+
+      - name: Check for new video files
+        id: check_files
+        run: |
+          VIDEO_COUNT=$(find videos -maxdepth 1 -name "*.mp4" -type f 2>/dev/null | wc -l)
+          echo "video_count=$VIDEO_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$VIDEO_COUNT" -gt 0 ]; then
+            
